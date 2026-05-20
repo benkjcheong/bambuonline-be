@@ -1,4 +1,6 @@
+python3 -m venv venv
 source venv/bin/activate
+pip install -e .
 python -m app
 
 *Give VSCode access to Local Network & Only LAN Mode on Bambu Printer
