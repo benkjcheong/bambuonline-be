@@ -64,7 +64,7 @@ def run() -> int:
     app_state.bind_control(control)
 
     api_host = os.environ.get("API_HOST", "0.0.0.0")
-    api_port = int(os.environ.get("API_PORT", "8000"))
+    api_port = int(os.environ.get("API_PORT", "1027"))
     api_server = ApiServer(build_app(app_state), host=api_host, port=api_port)
     api_server.start()
     log.info("api server listening on %s:%d", api_host, api_port)
