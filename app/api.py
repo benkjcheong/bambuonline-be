@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
+import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from starlette.concurrency import run_in_threadpool
@@ -20,7 +23,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .events import Event
 from .failure_detector import DetectionResult
 from .ftps_upload import FtpsUploadError
-from .printer_control import VALID_ACTIONS, VALID_LIGHT_MODES, PrinterControl
+from .printer_control import (
+    FAN_INDEX,
+    SPEED_LEVELS,
+    VALID_ACTIONS,
+    VALID_LIGHT_MODES,
+    PrinterControl,
+)
+from .slicer import SUPPORTED_INPUTS, Slicer, SlicerError, summarize_result
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +336,302 @@ def build_app(state: AppState) -> FastAPI:
             return JSONResponse({"ok": False, "error": "bad_action"}, status_code=400)
         ok, seq = ctrl.set_light(mode)
         return JSONResponse({"ok": ok, "mode": mode, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    # ---- device controls (Bambu Studio device-tab parity) -------------------
+
+    def _ctrl() -> PrinterControl | None:
+        ctrl = state.control()
+        if ctrl is None or not ctrl.is_connected():
+            return None
+        return ctrl
+
+    _DISCONNECTED = JSONResponse({"ok": False, "error": "mqtt_disconnected"}, status_code=503)
+
+    async def _json_body(request: Request) -> dict[str, Any]:
+        try:
+            body = await request.json()
+            return body if isinstance(body, dict) else {}
+        except Exception:
+            return {}
+
+    @app.post("/api/temp/{heater}")
+    async def set_temp(heater: str, request: Request) -> Response:
+        if heater not in ("nozzle", "bed"):
+            return JSONResponse({"ok": False, "error": "bad_heater"}, status_code=400)
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        body = await _json_body(request)
+        try:
+            target = int(body.get("target"))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "bad_target"}, status_code=400)
+        ok, seq = ctrl.set_nozzle_temp(target) if heater == "nozzle" else ctrl.set_bed_temp(target)
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    @app.post("/api/fan/{fan}")
+    async def set_fan(fan: str, request: Request) -> Response:
+        if fan not in FAN_INDEX:
+            return JSONResponse({"ok": False, "error": "bad_fan"}, status_code=400)
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        body = await _json_body(request)
+        try:
+            percent = int(body.get("percent"))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "bad_percent"}, status_code=400)
+        ok, seq = ctrl.set_fan(fan, percent)
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    @app.post("/api/speed")
+    async def set_speed(request: Request) -> Response:
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        body = await _json_body(request)
+        try:
+            level = int(body.get("level"))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "bad_level"}, status_code=400)
+        if level not in SPEED_LEVELS:
+            return JSONResponse({"ok": False, "error": "bad_level"}, status_code=400)
+        ok, seq = ctrl.set_speed_level(level)
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    def _movement_blocked() -> Response | None:
+        gcode = str(state.snapshot().get("gcode_state") or "").upper()
+        if gcode in {"RUNNING", "PREPARE", "PAUSE"}:
+            return JSONResponse({"ok": False, "error": "busy", "gcode_state": gcode}, status_code=409)
+        return None
+
+    @app.post("/api/move/home")
+    def move_home() -> Response:
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        blocked = _movement_blocked()
+        if blocked is not None:
+            return blocked
+        ok, seq = ctrl.home()
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    @app.post("/api/move")
+    async def move_jog(request: Request) -> Response:
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        blocked = _movement_blocked()
+        if blocked is not None:
+            return blocked
+        body = await _json_body(request)
+        axis = str(body.get("axis") or "").upper()
+        try:
+            dist = float(body.get("dist"))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "bad_dist"}, status_code=400)
+        if axis not in ("X", "Y", "Z") or not dist:
+            return JSONResponse({"ok": False, "error": "bad_axis_or_dist"}, status_code=400)
+        ok, seq = ctrl.jog(axis, dist)
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    @app.post("/api/extrude")
+    async def extrude(request: Request) -> Response:
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        blocked = _movement_blocked()
+        if blocked is not None:
+            return blocked
+        try:
+            nozzle = float(state.snapshot().get("nozzle_temper") or 0.0)
+        except (TypeError, ValueError):
+            nozzle = 0.0
+        if nozzle < 170.0:
+            return JSONResponse({"ok": False, "error": "nozzle_cold", "nozzle_temper": nozzle}, status_code=409)
+        body = await _json_body(request)
+        try:
+            dist = float(body.get("dist"))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "bad_dist"}, status_code=400)
+        if not dist:
+            return JSONResponse({"ok": False, "error": "bad_dist"}, status_code=400)
+        ok, seq = ctrl.extrude(dist)
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    # ---- SD card files -------------------------------------------------------
+
+    @app.get("/api/files")
+    async def list_files() -> Response:
+        ctrl = state.control()
+        if ctrl is None:
+            return _DISCONNECTED
+        try:
+            files = await run_in_threadpool(ctrl.list_sd_files)
+        except FtpsUploadError as exc:
+            return JSONResponse({"ok": False, "error": "ftps_failed", "detail": str(exc)}, status_code=502)
+        return JSONResponse({"ok": True, "files": files})
+
+    def _start_busy() -> Response | None:
+        gcode = str(state.snapshot().get("gcode_state") or "").upper()
+        if gcode not in {"IDLE", "FINISH", "FAILED", ""}:
+            return JSONResponse({"ok": False, "error": "busy", "gcode_state": gcode}, status_code=409)
+        return None
+
+    def _print_opts(body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            plate = int(body.get("plate", 1))
+        except (TypeError, ValueError):
+            plate = 1
+        return {
+            "plate": plate,
+            "use_ams": _form_bool(body.get("use_ams"), False),
+            "bed_leveling": _form_bool(body.get("bed_leveling"), True),
+            "flow_cali": _form_bool(body.get("flow_cali"), False),
+            "vibration_cali": _form_bool(body.get("vibration_cali"), True),
+            "layer_inspect": _form_bool(body.get("layer_inspect"), False),
+            "timelapse": _form_bool(body.get("timelapse"), False),
+        }
+
+    @app.post("/api/files/print")
+    async def print_sd_file(request: Request) -> Response:
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        busy = _start_busy()
+        if busy is not None:
+            return busy
+        body = await _json_body(request)
+        path = str(body.get("path") or "").strip().lstrip("/")
+        if not path.lower().endswith(".3mf") or ".." in path:
+            return JSONResponse({"ok": False, "error": "bad_path"}, status_code=400)
+        ok, seq = ctrl.start_existing(remote_path=path, **_print_opts(body))
+        return JSONResponse({"ok": ok, "sequence_id": seq}, status_code=200 if ok else 502)
+
+    @app.delete("/api/files")
+    async def delete_sd_file(path: str = "") -> Response:
+        ctrl = state.control()
+        if ctrl is None:
+            return _DISCONNECTED
+        clean = path.strip().lstrip("/")
+        if not clean.lower().endswith(".3mf") or ".." in clean:
+            return JSONResponse({"ok": False, "error": "bad_path"}, status_code=400)
+        try:
+            await run_in_threadpool(ctrl.delete_sd_file, clean)
+        except FtpsUploadError as exc:
+            return JSONResponse({"ok": False, "error": "ftps_failed", "detail": str(exc)}, status_code=502)
+        return JSONResponse({"ok": True})
+
+    # ---- slicing (Bambu Studio CLI) -----------------------------------------
+
+    slicer = Slicer()
+
+    @app.get("/api/slicer/presets")
+    def slicer_presets() -> dict[str, Any]:
+        return slicer.list_presets()
+
+    @app.post("/api/slice")
+    async def slice_model(request: Request) -> Response:
+        if not slicer.available():
+            return JSONResponse({"ok": False, "error": "slicer_unavailable"}, status_code=501)
+        try:
+            form = await request.form(max_part_size=_MAX_UPLOAD_BYTES)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": "bad_form", "detail": str(exc)}, status_code=400)
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            return JSONResponse({"ok": False, "error": "missing_file"}, status_code=400)
+        suffix = "." + upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
+        if suffix not in SUPPORTED_INPUTS:
+            return JSONResponse(
+                {"ok": False, "error": "bad_type", "supported": list(SUPPORTED_INPUTS)},
+                status_code=400,
+            )
+
+        tmpdir = tempfile.mkdtemp(prefix="spaghetteye-upload-")
+        src_path = Path(tmpdir) / ("model" + suffix)
+        try:
+            with open(src_path, "wb") as fh:
+                upload.file.seek(0)
+                while True:
+                    chunk = upload.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+        finally:
+            await upload.close()
+
+        machine = str(form.get("machine") or "") or None
+        process = str(form.get("process") or "") or None
+        filament = str(form.get("filament") or "") or None
+        try:
+            scale = float(form.get("scale")) if form.get("scale") else None
+        except (TypeError, ValueError):
+            scale = None
+        arrange = str(form.get("arrange") or "1")
+        orient = str(form.get("orient") or "2")
+
+        try:
+            job = await run_in_threadpool(
+                slicer.slice_file,
+                src_path,
+                upload.filename,
+                machine=machine,
+                process=process,
+                filament=filament,
+                scale=scale,
+                arrange=arrange,
+                orient=orient,
+            )
+        except SlicerError as exc:
+            return JSONResponse({"ok": False, "error": "slice_failed", "detail": str(exc)}, status_code=502)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        state.push_event(Event(kind="slice_done", title="Model sliced", file=upload.filename))
+        return JSONResponse({"ok": True, "job_id": job.job_id, "name": job.out_name, **summarize_result(job)})
+
+    @app.post("/api/slice/{job_id}/print")
+    async def slice_print(job_id: str, request: Request) -> Response:
+        job = slicer.get_job(job_id)
+        if job is None or not job.path.is_file():
+            return JSONResponse({"ok": False, "error": "unknown_job"}, status_code=404)
+        ctrl = _ctrl()
+        if ctrl is None:
+            return _DISCONNECTED
+        busy = _start_busy()
+        if busy is not None:
+            return busy
+        body = await _json_body(request)
+        opts = _print_opts(body)
+        safe_name = _safe_remote_name(job.out_name)
+
+        def _upload_and_start():
+            with open(job.path, "rb") as fh:
+                return ctrl.upload_and_start(
+                    src=fh,
+                    remote_name=safe_name,
+                    subtask_name=safe_name.rsplit(".", 1)[0],
+                    **opts,
+                )
+
+        try:
+            ok, seq = await run_in_threadpool(_upload_and_start)
+        except FtpsUploadError as exc:
+            return JSONResponse({"ok": False, "error": "ftps_failed", "detail": str(exc)}, status_code=502)
+        return JSONResponse({"ok": ok, "sequence_id": seq, "remote_name": safe_name}, status_code=200 if ok else 502)
+
+    @app.get("/api/slice/{job_id}/download")
+    def slice_download(job_id: str) -> Response:
+        job = slicer.get_job(job_id)
+        if job is None or not job.path.is_file():
+            return Response(status_code=404, content=b"unknown job")
+        data = job.path.read_bytes()
+        return Response(
+            content=data,
+            media_type="application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+            headers={"Content-Disposition": f'attachment; filename="{job.out_name}"'},
+        )
 
     @app.get("/api/stream")
     async def stream() -> StreamingResponse:

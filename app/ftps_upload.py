@@ -91,6 +91,80 @@ def _build_bambu_tls_context() -> ssl.SSLContext:
     return ctx
 
 
+def _connect(host: str, access_code: str, port: int, timeout_sec: float) -> _ImplicitFTP_TLS:
+    ftp = _ImplicitFTP_TLS(context=_build_bambu_tls_context(), timeout=timeout_sec)
+    ftp.connect(host=host, port=port, timeout=timeout_sec)
+    ftp.login(user="bblp", passwd=access_code)
+    ftp.prot_p()
+    ftp.set_pasv(True)
+    return ftp
+
+
+def _quit(ftp: _ImplicitFTP_TLS) -> None:
+    try:
+        ftp.quit()
+    except Exception:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+
+def list_3mf_files(
+    *,
+    host: str,
+    access_code: str,
+    dirs: tuple[str, ...] = ("", "cache"),
+    port: int = 990,
+    timeout_sec: float = 30.0,
+) -> list[dict]:
+    """List .3mf files on the printer SD card (root + cache)."""
+    ftp = _connect(host, access_code, port, timeout_sec)
+    files: list[dict] = []
+    try:
+        for d in dirs:
+            try:
+                names = ftp.nlst(d) if d else ftp.nlst()
+            except ftplib.all_errors as exc:
+                log.info("ftps nlst %r failed: %s", d, exc)
+                continue
+            for raw in names:
+                name = raw.rsplit("/", 1)[-1]
+                if not name.lower().endswith(".3mf"):
+                    continue
+                path = f"{d}/{name}" if d else name
+                size: int | None = None
+                try:
+                    ftp.voidcmd("TYPE I")
+                    size = ftp.size(path)
+                except ftplib.all_errors:
+                    pass
+                files.append({"name": name, "path": path, "dir": d or "/", "size": size})
+    except (ftplib.all_errors, OSError, ssl.SSLError) as exc:
+        raise FtpsUploadError(f"FTPS list failed: {exc}") from exc
+    finally:
+        _quit(ftp)
+    files.sort(key=lambda f: f["name"].lower())
+    return files
+
+
+def delete_file(
+    *,
+    host: str,
+    access_code: str,
+    path: str,
+    port: int = 990,
+    timeout_sec: float = 30.0,
+) -> None:
+    ftp = _connect(host, access_code, port, timeout_sec)
+    try:
+        ftp.delete(path)
+    except (ftplib.all_errors, OSError, ssl.SSLError) as exc:
+        raise FtpsUploadError(f"FTPS delete failed: {exc}") from exc
+    finally:
+        _quit(ftp)
+
+
 def upload_3mf(
     *,
     host: str,
