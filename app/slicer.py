@@ -18,11 +18,13 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_BIN = "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"
 _DEFAULT_PROFILE_DIR = "/Applications/BambuStudio.app/Contents/Resources/profiles/BBL"
-_DEFAULT_MODEL_NAME = "Bambu Lab A1"
-_DEFAULT_MODEL_CODE = "A1"
-_DEFAULT_MACHINE = "Bambu Lab A1 0.4 nozzle"
-_DEFAULT_PROCESS = "0.20mm Standard @BBL A1"
-_DEFAULT_FILAMENT = "Bambu PLA Basic @BBL A1"
+_DEFAULT_MODEL_NAME = "Bambu Lab A1 mini"
+_DEFAULT_MODEL_CODE = "A1M"
+_DEFAULT_MACHINE = "Bambu Lab A1 mini 0.4 nozzle"
+_DEFAULT_PROCESS = "0.20mm Standard @BBL A1M"
+_DEFAULT_FILAMENT = "Alt Tab PLA Basic @Bambu Lab A1 mini 0.4 nozzle"
+# Custom (user) filament presets live here, not in the app bundle's BBL profiles.
+_DEFAULT_USER_PROFILE_DIR = str(Path.home() / "Library/Application Support/BambuStudio/user")
 
 SUPPORTED_INPUTS = (".stl", ".3mf", ".step", ".stp", ".obj")
 
@@ -48,6 +50,9 @@ class Slicer:
     def __init__(self) -> None:
         self.binary = os.environ.get("SLICER_BIN", "").strip() or _DEFAULT_BIN
         self.profile_dir = Path(os.environ.get("SLICER_PROFILE_DIR", "").strip() or _DEFAULT_PROFILE_DIR)
+        self.user_profile_dir = Path(
+            os.environ.get("SLICER_USER_PROFILE_DIR", "").strip() or _DEFAULT_USER_PROFILE_DIR
+        ).expanduser()
         self.model_code = os.environ.get("SLICER_MODEL_CODE", "").strip() or _DEFAULT_MODEL_CODE
         self.model_name = os.environ.get("SLICER_MODEL_NAME", "").strip() or _DEFAULT_MODEL_NAME
         self.default_machine = os.environ.get("SLICER_MACHINE", "").strip() or _DEFAULT_MACHINE
@@ -81,7 +86,9 @@ class Slicer:
             "available": self.available(),
             "machine": names("machine", lambda n: machine_re.match(n)),
             "process": names("process", lambda n: suffix.search(n)),
-            "filament": names("filament", lambda n: suffix.search(n)),
+            # Filament list = the user's own custom presets only; stock Bambu/eSun
+            # profiles are intentionally hidden.
+            "filament": sorted(self._user_filament_presets()),
             "defaults": {
                 "machine": self.default_machine,
                 "process": self.default_process,
@@ -89,13 +96,49 @@ class Slicer:
             },
         }
 
+    def _user_filament_presets(self) -> dict[str, Path]:
+        """Map custom filament preset name -> json path, scanned from the Bambu user dir.
+
+        Only presets compatible with the configured machine are included, so a
+        switch of printer model doesn't surface incompatible profiles.
+        """
+        out: dict[str, Path] = {}
+        if not self.user_profile_dir.is_dir():
+            return out
+        for p in self.user_profile_dir.glob("*/filament/**/*.json"):
+            try:
+                data = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            compatible = data.get("compatible_printers") or []
+            if isinstance(compatible, str):
+                compatible = [compatible]
+            if compatible and self.default_machine not in compatible:
+                continue
+            name = data.get("name") or p.stem
+            out[str(name)] = p
+        return out
+
+    def _filament_path(self, name: str) -> Path:
+        safe = (name or "").strip()
+        if not safe:
+            raise SlicerError("filament preset name is empty")
+        presets = self._user_filament_presets()
+        p = presets.get(safe)
+        if p is None or not p.is_file():
+            raise SlicerError(f"unknown filament preset: {safe}")
+        return p
+
     def _filament_density(self, name: str) -> float:
         """Walk the preset's 'inherits' chain for filament_density; CLI output drops it."""
         seen: set[str] = set()
+        user_presets = self._user_filament_presets()
         current = name
         while current and current not in seen:
             seen.add(current)
-            p = self.profile_dir / "filament" / f"{current}.json"
+            # Custom presets live in the user dir; inherited parents may fall
+            # back to the stock BBL profiles.
+            p = user_presets.get(current) or self.profile_dir / "filament" / f"{current}.json"
             if not p.is_file():
                 break
             try:
@@ -188,7 +231,7 @@ class Slicer:
             raise SlicerError(f"slicer binary not found at {self.binary}")
         machine_p = self._preset_path("machine", machine or self.default_machine)
         process_p = self._preset_path("process", process or self.default_process)
-        filament_p = self._preset_path("filament", filament or self.default_filament)
+        filament_p = self._filament_path(filament or self.default_filament)
 
         if src_path.suffix.lower() == ".3mf":
             self._inject_project_settings(src_path, machine_p, process_p, filament_p)
