@@ -418,5 +418,7 @@
     "version": "2.3.0.5",
     "volumetric_speed_coefficients": [
         "0 0 0 0 0 0"
-    ]
+    ],
+    "type": "filament",
+    "instantiation": "true"
 }
