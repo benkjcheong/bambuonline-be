@@ -25,6 +25,9 @@ _DEFAULT_PROCESS = "0.20mm Standard @BBL A1M"
 _DEFAULT_FILAMENT = "Alt Tab PLA Basic @Bambu Lab A1 mini 0.4 nozzle"
 # Custom (user) filament presets live here, not in the app bundle's BBL profiles.
 _DEFAULT_USER_PROFILE_DIR = str(Path.home() / "Library/Application Support/BambuStudio/user")
+# Presets vendored alongside the repo (bambuonline-be/presets/), so the app
+# doesn't depend on a local Bambu Studio install having them.
+_DEFAULT_REPO_PRESET_DIR = str(Path(__file__).resolve().parent.parent / "presets")
 
 SUPPORTED_INPUTS = (".stl", ".3mf", ".step", ".stp", ".obj")
 
@@ -52,6 +55,11 @@ class Slicer:
         self.profile_dir = Path(os.environ.get("SLICER_PROFILE_DIR", "").strip() or _DEFAULT_PROFILE_DIR)
         self.user_profile_dir = Path(
             os.environ.get("SLICER_USER_PROFILE_DIR", "").strip() or _DEFAULT_USER_PROFILE_DIR
+        ).expanduser()
+        # Filament presets vendored into the repo — the canonical source of truth,
+        # surviving a Bambu Studio reinstall/cloud-sync. Overrides same-named user presets.
+        self.repo_preset_dir = Path(
+            os.environ.get("SLICER_REPO_PRESET_DIR", "").strip() or _DEFAULT_REPO_PRESET_DIR
         ).expanduser()
         self.model_code = os.environ.get("SLICER_MODEL_CODE", "").strip() or _DEFAULT_MODEL_CODE
         self.model_name = os.environ.get("SLICER_MODEL_NAME", "").strip() or _DEFAULT_MODEL_NAME
@@ -88,7 +96,7 @@ class Slicer:
             "process": names("process", lambda n: suffix.search(n)),
             # Filament list = the user's own custom presets only; stock Bambu/eSun
             # profiles are intentionally hidden.
-            "filament": sorted(self._user_filament_presets()),
+            "filament": sorted(self._filament_preset_map()),
             "defaults": {
                 "machine": self.default_machine,
                 "process": self.default_process,
@@ -96,34 +104,40 @@ class Slicer:
             },
         }
 
-    def _user_filament_presets(self) -> dict[str, Path]:
-        """Map custom filament preset name -> json path, scanned from the Bambu user dir.
+    def _filament_preset_map(self) -> dict[str, Path]:
+        """Map custom filament preset name -> json path.
 
-        Only presets compatible with the configured machine are included, so a
-        switch of printer model doesn't surface incompatible profiles.
+        Scans two sources: the user's Bambu Studio profile dir and the presets
+        vendored in this repo. Repo presets win on a name collision, so the
+        committed copy is authoritative regardless of local Studio state. Only
+        presets compatible with the configured machine are included.
         """
         out: dict[str, Path] = {}
-        if not self.user_profile_dir.is_dir():
-            return out
-        for p in self.user_profile_dir.glob("*/filament/**/*.json"):
-            try:
-                data = json.loads(p.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            compatible = data.get("compatible_printers") or []
-            if isinstance(compatible, str):
-                compatible = [compatible]
-            if compatible and self.default_machine not in compatible:
-                continue
-            name = data.get("name") or p.stem
-            out[str(name)] = p
+        # User dir first (lower priority), then repo presets override by name.
+        sources = [
+            self.user_profile_dir.glob("*/filament/**/*.json") if self.user_profile_dir.is_dir() else [],
+            (self.repo_preset_dir / "filament").glob("*.json") if self.repo_preset_dir.is_dir() else [],
+        ]
+        for paths in sources:
+            for p in paths:
+                try:
+                    data = json.loads(p.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                compatible = data.get("compatible_printers") or []
+                if isinstance(compatible, str):
+                    compatible = [compatible]
+                if compatible and self.default_machine not in compatible:
+                    continue
+                name = data.get("name") or p.stem
+                out[str(name)] = p
         return out
 
     def _filament_path(self, name: str) -> Path:
         safe = (name or "").strip()
         if not safe:
             raise SlicerError("filament preset name is empty")
-        presets = self._user_filament_presets()
+        presets = self._filament_preset_map()
         p = presets.get(safe)
         if p is None or not p.is_file():
             raise SlicerError(f"unknown filament preset: {safe}")
@@ -132,13 +146,13 @@ class Slicer:
     def _filament_density(self, name: str) -> float:
         """Walk the preset's 'inherits' chain for filament_density; CLI output drops it."""
         seen: set[str] = set()
-        user_presets = self._user_filament_presets()
+        custom_presets = self._filament_preset_map()
         current = name
         while current and current not in seen:
             seen.add(current)
             # Custom presets live in the user dir; inherited parents may fall
             # back to the stock BBL profiles.
-            p = user_presets.get(current) or self.profile_dir / "filament" / f"{current}.json"
+            p = custom_presets.get(current) or self.profile_dir / "filament" / f"{current}.json"
             if not p.is_file():
                 break
             try:
