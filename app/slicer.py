@@ -23,10 +23,8 @@ _DEFAULT_MODEL_CODE = "A1M"
 _DEFAULT_MACHINE = "Bambu Lab A1 mini 0.4 nozzle"
 _DEFAULT_PROCESS = "0.20mm Standard @BBL A1M"
 _DEFAULT_FILAMENT = "Alt Tab PLA Basic @Bambu Lab A1 mini 0.4 nozzle"
-# Custom (user) filament presets live here, not in the app bundle's BBL profiles.
-_DEFAULT_USER_PROFILE_DIR = str(Path.home() / "Library/Application Support/BambuStudio/user")
-# Presets vendored alongside the repo (bambuonline-be/presets/), so the app
-# doesn't depend on a local Bambu Studio install having them.
+# Custom filament presets vendored alongside the repo (bambuonline-be/presets/),
+# so the app doesn't depend on a local Bambu Studio install having them.
 _DEFAULT_REPO_PRESET_DIR = str(Path(__file__).resolve().parent.parent / "presets")
 
 SUPPORTED_INPUTS = (".stl", ".3mf", ".step", ".stp", ".obj")
@@ -53,11 +51,7 @@ class Slicer:
     def __init__(self) -> None:
         self.binary = os.environ.get("SLICER_BIN", "").strip() or _DEFAULT_BIN
         self.profile_dir = Path(os.environ.get("SLICER_PROFILE_DIR", "").strip() or _DEFAULT_PROFILE_DIR)
-        self.user_profile_dir = Path(
-            os.environ.get("SLICER_USER_PROFILE_DIR", "").strip() or _DEFAULT_USER_PROFILE_DIR
-        ).expanduser()
-        # Filament presets vendored into the repo — the canonical source of truth,
-        # surviving a Bambu Studio reinstall/cloud-sync. Overrides same-named user presets.
+        # Filament presets vendored into the repo — the sole source of truth.
         self.repo_preset_dir = Path(
             os.environ.get("SLICER_REPO_PRESET_DIR", "").strip() or _DEFAULT_REPO_PRESET_DIR
         ).expanduser()
@@ -107,30 +101,27 @@ class Slicer:
     def _filament_preset_map(self) -> dict[str, Path]:
         """Map custom filament preset name -> json path.
 
-        Scans two sources: the user's Bambu Studio profile dir and the presets
-        vendored in this repo. Repo presets win on a name collision, so the
-        committed copy is authoritative regardless of local Studio state. Only
-        presets compatible with the configured machine are included.
+        Sourced solely from the presets committed to this repo
+        (presets/filament/*.json) — the app does not read Bambu Studio's local
+        profile dir. Only presets compatible with the configured machine are
+        included.
         """
         out: dict[str, Path] = {}
-        # User dir first (lower priority), then repo presets override by name.
-        sources = [
-            self.user_profile_dir.glob("*/filament/**/*.json") if self.user_profile_dir.is_dir() else [],
-            (self.repo_preset_dir / "filament").glob("*.json") if self.repo_preset_dir.is_dir() else [],
-        ]
-        for paths in sources:
-            for p in paths:
-                try:
-                    data = json.loads(p.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                compatible = data.get("compatible_printers") or []
-                if isinstance(compatible, str):
-                    compatible = [compatible]
-                if compatible and self.default_machine not in compatible:
-                    continue
-                name = data.get("name") or p.stem
-                out[str(name)] = p
+        d = self.repo_preset_dir / "filament"
+        if not d.is_dir():
+            return out
+        for p in d.glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            compatible = data.get("compatible_printers") or []
+            if isinstance(compatible, str):
+                compatible = [compatible]
+            if compatible and self.default_machine not in compatible:
+                continue
+            name = data.get("name") or p.stem
+            out[str(name)] = p
         return out
 
     def _filament_path(self, name: str) -> Path:
